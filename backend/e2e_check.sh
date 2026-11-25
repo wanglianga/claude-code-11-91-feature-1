@@ -90,6 +90,47 @@ check "充电单判定受保护" "PROTECTED_CHARGING" "$(echo "$IMP" | python3 -
 check "充电中取消被拒" "409" "$(code "/api/reservations/$CID/cancel" '{"idempotency_key":"e2e-chg-eeee-5"}')"
 check "订单状态仍是 CHARGING" "CHARGING" "$(curl -s $BASE/api/reservations/$CID | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
 
+echo "== 9. 车队批次 F-8（逐车确认，最低就绪数 2）：单车确认不等于车队就绪 =="
+# A 车确认成功：只计 1 辆，批次仍 OPEN，不发车队就绪通知
+A=$(post /api/fleet/batches/1/items/1/confirm '{"idempotency_key":"e2e-f8-a-000001"}')
+check "A 车确认 outcome" "CONFIRMED" "$(echo "$A" | python3 -c 'import json,sys;print(json.load(sys.stdin)["outcome"])')"
+check "A 确认后就绪数" "1" "$(echo "$A" | python3 -c 'import json,sys;print(json.load(sys.stdin)["ready_count"])')"
+check "A 确认后批次状态" "OPEN" "$(echo "$A" | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
+check "未发车队就绪通知" "False" "$(echo "$A" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(any(e["event_type"]=="FLEET_READY" for e in d["events"]))')"
+check "A 已收到进场码" "True" "$(echo "$A" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(bool(next(i for i in d["items"] if i["id"]==1)["access_code"]))')"
+# 同键重放：不产生新子预约
+A_REF=$(echo "$A" | python3 -c 'import json,sys;print(next(i for i in json.load(sys.stdin)["items"] if i["id"]==1)["reservation_ref"])')
+check "A 重放返回同一子预约" "$A_REF" "$(post /api/fleet/batches/1/items/1/confirm '{"idempotency_key":"e2e-f8-a-000001"}' | python3 -c 'import json,sys;print(next(i for i in json.load(sys.stdin)["items"] if i["id"]==1)["reservation_ref"])')"
+
+echo "== 10. N1 唯一 120kW 被占、N3 被个人用户占用：B/C 均被拒，界面保持未达 2 辆 =="
+check "B 车确认被拒" "REJECTED" "$(post /api/fleet/batches/1/items/2/confirm '{"idempotency_key":"e2e-f8-b-000001"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["outcome"])')"
+check "C 车确认被拒（N3 占用）" "REJECTED" "$(post /api/fleet/batches/1/items/3/confirm '{"idempotency_key":"e2e-f8-c-000001"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["outcome"])')"
+check "批次仍未宣布就绪" "False" "$(curl -s $BASE/api/fleet/batches/1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["ready_declared"])')"
+check "未满足清单含 B/C 两车" "2" "$(curl -s $BASE/api/fleet/batches/1 | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["unmet_items"]))')"
+
+echo "== 11. 个人用户释放 N3 后 C 可确认：达到 2 辆才发车队就绪通知 =="
+N3_ID=$(curl -s $BASE/api/reservations | python3 -c 'import json,sys;print(next(r["id"] for r in json.load(sys.stdin) if r["ref"]=="R-SEEDN01"))')
+post "/api/reservations/$N3_ID/cancel" '{"idempotency_key":"e2e-f8-rel-00001"}' > /dev/null
+C2=$(post /api/fleet/batches/1/items/3/confirm '{"idempotency_key":"e2e-f8-c-000002"}')
+check "C 车二次确认成功" "CONFIRMED" "$(echo "$C2" | python3 -c 'import json,sys;print(json.load(sys.stdin)["outcome"])')"
+check "就绪数达到 2" "2" "$(echo "$C2" | python3 -c 'import json,sys;print(json.load(sys.stdin)["ready_count"])')"
+check "批次状态 READY" "READY" "$(echo "$C2" | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
+check "已发车队就绪通知" "True" "$(echo "$C2" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(any(e["event_type"]=="FLEET_READY" for e in d["events"]))')"
+
+echo "== 12. 一笔取消使已宣布的车队就绪重新变为不足 =="
+A_RID=$(echo "$C2" | python3 -c 'import json,sys;print(next(i for i in json.load(sys.stdin)["items"] if i["id"]==1)["reservation_id"])')
+post "/api/reservations/$A_RID/cancel" '{"idempotency_key":"e2e-f8-cancela-1"}' > /dev/null
+check "取消后就绪数跌回 1" "1" "$(curl -s $BASE/api/fleet/batches/1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["ready_count"])')"
+check "批次回到 OPEN" "OPEN" "$(curl -s $BASE/api/fleet/batches/1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')"
+check "产生就绪撤回事件" "True" "$(curl -s $BASE/api/fleet/batches/1 | python3 -c 'import json,sys;d=json.load(sys.stdin);print(any(e["event_type"]=="FLEET_READY_WITHDRAWN" for e in d["events"]))')"
+
+echo "== 13. 原子组合路线：达不到最低就绪数时整体拒绝、零容量占用 =="
+BEFORE=$(curl -s $BASE/api/reservations | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')
+ATOMIC_ID=$(post /api/fleet/batches '{"fleet_no":"F-9E2E","site_id":2,"strategy":"ATOMIC","min_ready":3,"items":[{"vehicle_label":"A 车","vehicle_id":6,"connector_type":"CCS","min_power_kw":120,"arrival_start":"2026-11-27T05:00:00","arrival_end":"2026-11-27T05:30:00","departure_at":"2026-11-27T06:00:00","mode":"CONNECTOR"},{"vehicle_label":"B 车","vehicle_id":7,"connector_type":"CCS","min_power_kw":120,"arrival_start":"2026-11-27T05:00:00","arrival_end":"2026-11-27T05:30:00","departure_at":"2026-11-27T06:00:00","mode":"CONNECTOR"},{"vehicle_label":"C 车","vehicle_id":8,"connector_type":"CCS","min_power_kw":60,"arrival_start":"2026-11-27T05:00:00","arrival_end":"2026-11-27T06:00:00","departure_at":"2026-11-27T06:00:00","mode":"CONNECTOR"}],"idempotency_key":"e2e-f9-create-001"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+check "原子求解被整体拒绝" "REJECTED" "$(post /api/fleet/batches/$ATOMIC_ID/atomic-confirm '{"idempotency_key":"e2e-f9-solve-001"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["outcome"])')"
+check "原子失败零容量占用" "$BEFORE" "$(curl -s $BASE/api/reservations | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')"
+check "原子失败重放仍零占用" "REJECTED" "$(post /api/fleet/batches/$ATOMIC_ID/atomic-confirm '{"idempotency_key":"e2e-f9-solve-001"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["outcome"])')"
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" -eq 0 ]

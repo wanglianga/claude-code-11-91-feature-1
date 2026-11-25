@@ -217,6 +217,10 @@ def _assess_impacts(db: Session, mw: MaintenanceWindow) -> list[dict]:
             "reason": reason_parts,
         })
     db.flush()
+    # 维护导致子预约改选/人工联系后，关联车队批次立即重算就绪数
+    from .fleet import reconcile_for_reservation
+    for r in reservations:
+        reconcile_for_reservation(db, r, trigger="MAINTENANCE_IMPACT")
     return impacts
 
 
@@ -366,4 +370,7 @@ def create_service_action(db: Session, req: ServiceActionCreate) -> ServiceActio
         "target_connector_id": req.target_connector_id,
         "note": req.note,
     })
+    # 客服替代枪口可能把改选状态的批次子预约救回 CONFIRMED：批次立即重算
+    from .fleet import reconcile_for_reservation
+    reconcile_for_reservation(db, reservation, trigger=f"SERVICE_{req.kind.value}")
     return action

@@ -47,3 +47,21 @@ class ImpactDecision(str, enum.Enum):
     NEEDS_RESELECTION = "NEEDS_RESELECTION"      # 进入改选
     MANUAL_CONTACT = "MANUAL_CONTACT"            # 已到站，人工联系
     PROTECTED_CHARGING = "PROTECTED_CHARGING"    # 充电中，受保护不可释放
+
+
+class FleetStrategy(str, enum.Enum):
+    GRADUAL = "GRADUAL"    # 逐车确认：可逐车累计进度，早确认的车辆先收到导航/进场码
+    ATOMIC = "ATOMIC"      # 原子组合：先求出达到最低就绪数的兼容组合，再一次提交确认
+
+
+class FleetBatchStatus(str, enum.Enum):
+    OPEN = "OPEN"                # 未达最低就绪数，仍可继续确认/重算
+    READY = "READY"              # 已达最低就绪数，并已发出车队就绪通知
+
+
+class FleetItemStatus(str, enum.Enum):
+    PENDING = "PENDING"          # 尚未确认
+    CONFIRMED = "CONFIRMED"      # 子预约已确认，持有容量并计入就绪数
+    FAILED = "FAILED"            # 最近一次确认未成功（保留原因，可重试）
+    CANCELLED = "CANCELLED"      # 子预约已取消，容量释放
+    RESELECTED = "RESELECTED"    # 枪口失能等导致子预约进入改选，不再计入就绪数

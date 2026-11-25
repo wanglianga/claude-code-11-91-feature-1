@@ -52,3 +52,21 @@ export const IMPACT_LABELS = {
   MANUAL_CONTACT: '人工联系',
   PROTECTED_CHARGING: '充电中受保护',
 }
+
+export const FLEET_STRATEGY_LABELS = {
+  GRADUAL: '逐车确认（早确认早拿进场码）',
+  ATOMIC: '原子组合（达标后一次确认）',
+}
+
+export const FLEET_BATCH_STATUS_LABELS = {
+  OPEN: '未达最低就绪数',
+  READY: '车队已就绪',
+}
+
+export const FLEET_ITEM_STATUS_LABELS = {
+  PENDING: '待确认',
+  CONFIRMED: '子预约已确认',
+  FAILED: '确认被拒',
+  CANCELLED: '子预约已取消',
+  RESELECTED: '枪口失能待改选',
+}

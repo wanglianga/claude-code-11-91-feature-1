@@ -67,16 +67,33 @@ def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
         text("SELECT pg_advisory_xact_lock(:ns, :sid)"),
         {"ns": LOCK_NS_SITE, "sid": site.id},
     )
+    return create_reservation_locked(
+        db, site, vehicle, start, end,
+        req.min_power_kw, req.mode, req.preferred_connector_id,
+    )
 
-    evaluation = evaluate_site(db, site.id, vehicle, start, end, req.min_power_kw)
+
+def create_reservation_locked(
+    db: Session,
+    site: Site,
+    vehicle: Vehicle,
+    start: datetime,
+    end: datetime,
+    min_power_kw: float,
+    mode: ReservationMode,
+    preferred_connector_id: int | None = None,
+    fleet_batch_item_id: int | None = None,
+) -> Reservation:
+    """在已持有站点咨询锁的事务内落单。车队批次的逐车/原子确认复用本助手。"""
+    evaluation = evaluate_site(db, site.id, vehicle, start, end, min_power_kw)
 
     connector_id: int | None = None
     snapshot: dict
 
-    if req.mode == ReservationMode.CONNECTOR:
+    if mode == ReservationMode.CONNECTOR:
         chosen = None
-        if req.preferred_connector_id is not None:
-            chosen = find_connector_eval(evaluation.connector_evals, req.preferred_connector_id)
+        if preferred_connector_id is not None:
+            chosen = find_connector_eval(evaluation.connector_evals, preferred_connector_id)
             if chosen is None:
                 raise HTTPException(404, "指定枪口不在该站点")
             if not chosen.eligible:
@@ -102,13 +119,14 @@ def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
             )
         connector_id = chosen.connector.id
         snapshot = {
-            "mode": req.mode.value,
+            "mode": mode.value,
             "connector_id": chosen.connector.id,
             "connector_code": chosen.connector.code,
             "connector_type": chosen.connector.connector_type,
-            "min_power_kw": req.min_power_kw,
+            "min_power_kw": min_power_kw,
             "effective_power_kw": chosen.min_power,
             "accessible": chosen.connector.accessible,
+            "fleet_batch_item_id": fleet_batch_item_id,
             "promise": f"锁定枪口 {chosen.connector.code}，全程有效功率不低于 {chosen.min_power:g}kW",
         }
     else:
@@ -125,12 +143,13 @@ def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
                 },
             )
         snapshot = {
-            "mode": req.mode.value,
+            "mode": mode.value,
             "connector_id": None,
             "connector_code": None,
             "connector_type": vehicle.connector_type,
-            "min_power_kw": req.min_power_kw,
+            "min_power_kw": min_power_kw,
             "accessible_required": vehicle.accessible,
+            "fleet_batch_item_id": fleet_batch_item_id,
             "confirmable_slots_at_booking": evaluation.confirmable_pool_slots,
             "promise": (
                 f"站点资源池名额 1 个（当时池内可同时履约名额 "
@@ -142,13 +161,14 @@ def confirm_reservation(db: Session, req: ConfirmRequest) -> Reservation:
         ref=_new_ref(),
         vehicle_id=vehicle.id,
         site_id=site.id,
-        mode=req.mode,
+        mode=mode,
         status=ReservationStatus.CONFIRMED,
         start_at=start,
         end_at=end,
-        min_power_kw=req.min_power_kw,
+        min_power_kw=min_power_kw,
         connector_id=connector_id,
         confirmation_snapshot=json.dumps(snapshot, ensure_ascii=False, default=str),
+        fleet_batch_item_id=fleet_batch_item_id,
     )
     db.add(reservation)
     db.flush()
@@ -202,7 +222,11 @@ def cancel(db: Session, reservation_id: int) -> Reservation:
             "released_connector_id": r.connector_id,
             "note": "容量已释放，可被新预约使用",
         })
-    return _transition(db, reservation_id, "cancel", build)
+    reservation = _transition(db, reservation_id, "cancel", build)
+    # 车队子预约取消后立即重算批次：可能把已宣布的车队就绪撤回
+    from .fleet import reconcile_for_reservation
+    reconcile_for_reservation(db, reservation, trigger="RESERVATION_CANCELLED")
+    return reservation
 
 
 def mark_no_show(db: Session, reservation_id: int) -> Reservation:
@@ -211,7 +235,10 @@ def mark_no_show(db: Session, reservation_id: int) -> Reservation:
             raise HTTPException(409, "预约开始时间未到，不能标记迟到；如需放弃请取消")
         r.status = ReservationStatus.NO_SHOW
         _add_event(db, r, "NO_SHOW", {"released_connector_id": r.connector_id})
-    return _transition(db, reservation_id, "no_show", build)
+    reservation = _transition(db, reservation_id, "no_show", build)
+    from .fleet import reconcile_for_reservation
+    reconcile_for_reservation(db, reservation, trigger="RESERVATION_NO_SHOW")
+    return reservation
 
 
 def arrive(db: Session, reservation_id: int) -> Reservation:
